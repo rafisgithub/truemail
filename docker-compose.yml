@@ -1,0 +1,88 @@
+# Self-hosted Truemail servers (https://truemail-rb.org).
+#
+# TWO SERVICES, because the validation layer is server-side configuration: the
+# HTTP API accepts only ?email=, so DEFAULT_VALIDATION_TYPE cannot be chosen
+# per request. Running both means either layer is reachable without a restart.
+#
+#   truemail_mx    from :9292  DNS/MX layer only. No SMTP session, so no
+#                              outbound port 25 and no dependence on this
+#                              host's IP reputation. Cheap pre-filter to drop
+#                              dead domains.
+#
+#   truemail_smtp  from :9302  Full pipeline including the RCPT TO probe.
+#                              Requires outbound port 25 AND a PTR record for
+#                              this host resolving to VERIFIER_DOMAIN. Truemail
+#                              has no proxy support (truemail-rb/truemail#238,
+#                              frozen), so this probe always leaves from this
+#                              machine's own IP.
+#
+# CONCURRENCY. Each container runs thin in single-process mode and handles
+# requests SERIALLY -- measured here, 12 concurrent requests against one
+# container each returned in ~11s (they queued) while total wall time barely
+# improved over a single worker. Client-side threads alone therefore buy almost
+# nothing; throughput comes from running more containers. Measured on 30 cold
+# addresses at 10 client workers: 1 replica 48.3s, 4 replicas 20.2s (2.4x --
+# sub-linear because upstream DNS is the shared bottleneck).
+#
+# To run with real 10-way concurrency:
+#
+#   echo 'MX_REPLICAS=10' >> .env
+#   docker compose up -d
+#   python3 test_truemail.py --workers 10        # auto-detects the replicas
+#
+# Replica count is capped by the published port range below (10 per service).
+# Containers are named <project>-<service>-<n>, e.g. truemail-truemail_mx-1;
+# `docker compose logs truemail_mx` shows all replicas of a service.
+#
+# Configuration lives in .env (gitignored); see .env.example.
+
+x-truemail-base: &truemail-base
+  image: truemail/truemail-rack:v0.10.0
+  restart: unless-stopped
+  tty: true
+  healthcheck:
+    # The image ships its own HEALTHCHECK; this overrides it only to add a
+    # start_period so the container is not marked unhealthy while thin boots.
+    # /healthcheck is the one endpoint that needs no Authorization header.
+    test: ["CMD", "curl", "-fsS", "http://127.0.0.1:9292/healthcheck"]
+    interval: 10s
+    timeout: 5s
+    retries: 5
+    start_period: 10s
+
+x-truemail-env: &truemail-env
+  VERIFIER_EMAIL: ${VERIFIER_EMAIL:?set VERIFIER_EMAIL in .env}
+  ACCESS_TOKENS: ${ACCESS_TOKENS:?set ACCESS_TOKENS in .env}
+  DNS: ${DNS:-1.1.1.1,8.8.8.8}
+  CONNECTION_TIMEOUT: ${CONNECTION_TIMEOUT:-2}
+  RESPONSE_TIMEOUT: ${RESPONSE_TIMEOUT:-2}
+  CONNECTION_ATTEMPTS: ${CONNECTION_ATTEMPTS:-2}
+  LOG_STDOUT: ${LOG_STDOUT:-true}
+
+services:
+  truemail_mx:
+    <<: *truemail-base
+    ports:
+      # One published port per replica, assigned from this range.
+      - "9292-9301:9292"
+    deploy:
+      replicas: ${MX_REPLICAS:-1}
+    environment:
+      <<: *truemail-env
+      DEFAULT_VALIDATION_TYPE: mx
+
+  truemail_smtp:
+    <<: *truemail-base
+    ports:
+      - "9302-9311:9292"
+    deploy:
+      replicas: ${SMTP_REPLICAS:-1}
+    environment:
+      <<: *truemail-env
+      DEFAULT_VALIDATION_TYPE: smtp
+      # End the session after the first failure on the first MX server. Cuts a
+      # failing SMTP validation to roughly a second.
+      SMTP_FAIL_FAST: ${SMTP_FAIL_FAST:-true}
+      # Parse SMTP error bodies for servers that never say plainly that an
+      # address does not exist.
+      SMTP_SAFE_CHECK: ${SMTP_SAFE_CHECK:-true}
